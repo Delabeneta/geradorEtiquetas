@@ -1,16 +1,15 @@
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import simpleSplit
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
-import time
 import sys
 import os
+import re
 import tempfile
 import unicodedata
 from datetime import datetime
 
-from updater import verificar_atualizacao, baixar_atualizacao, aplicar_atualizacao_e_reiniciar
+# Obs.: reportlab, openpyxl e updater são importados só quando necessários
+# (dentro das funções), para a janela de início aparecer o mais rápido possível.
 
 VERSION = "3.0.0"
 
@@ -68,7 +67,7 @@ entrada_excel = None
 combo_capela = None
 modo = None
 status_label = None
-dados_atual = None
+dados_atual = None       # lista de dicts da última geração
 frame_manual = None
 frame_tipo = None
 botao_procurar = None
@@ -130,19 +129,16 @@ def mostrar_tela_inicio():
         rodar na thread principal do Tkinter.
         """
         try:
-            splash.after(0, atualizar_progresso_ui, 10, "Preparando ambiente...")
-            time.sleep(0.1)
-
-            # Pré-carrega os módulos pesados de verdade (antes eram só textos decorativos)
-            splash.after(0, atualizar_progresso_ui, 40, "Carregando módulos de PDF...")
+            splash.after(0, atualizar_progresso_ui, 15, "Carregando módulos de PDF...")
+            # Pré-carrega os módulos pesados de verdade, enquanto a splash está na tela
             import reportlab  # noqa: F401
             from reportlab.pdfgen import canvas as _c  # noqa: F401
+            from reportlab.lib.utils import simpleSplit as _s  # noqa: F401
 
-            splash.after(0, atualizar_progresso_ui, 70, "Carregando módulos de planilha...")
-            import pandas  # noqa: F401
+            splash.after(0, atualizar_progresso_ui, 65, "Carregando módulos de planilha...")
+            import openpyxl  # noqa: F401
 
             splash.after(0, atualizar_progresso_ui, 100, "Sistema pronto!")
-            time.sleep(0.2)
 
             splash.after(0, lambda: (splash.destroy(), iniciar_sistema_principal()))
 
@@ -187,84 +183,112 @@ def normalizar_tipo(valor):
 
 
 # =========================
-# LEITURA DO EXCEL
+# LEITURA DO EXCEL (openpyxl — bem mais leve que o pandas)
 # =========================
+def _texto(valor):
+    return "" if valor is None else str(valor).strip()
+
+
+def _texto_codigo(valor):
+    """Código como texto, sem o '.0' que números inteiros ganham ao virar float."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and valor.is_integer():
+        return str(int(valor))
+    return re.sub(r"\.0$", "", str(valor).strip())
+
+
 def ler_excel(caminho, tipo_padrao=TIPO_ADULTO):
     """
-    Lê a planilha. Colunas obrigatórias: NOME, CÓDIGO e COMUNIDADE (ou CAPELA).
+    Lê a primeira aba da planilha (.xlsx / .xlsm).
+    Colunas obrigatórias: NOME, CÓDIGO e COMUNIDADE (ou CAPELA).
     Coluna opcional: TIPO (ADULTO ou INFANTIL), definida linha a linha.
     Linhas sem tipo (ou planilhas sem a coluna) usam `tipo_padrao`.
+    Retorna uma lista de dicts: NOME, CÓDIGO DIZIMISTA, COMUNIDADE, TIPO.
     """
-    import pandas as pd
+    from openpyxl import load_workbook
 
-    df_bruto = pd.read_excel(caminho, header=None)
+    if caminho.lower().endswith(".xls"):
+        raise Exception(
+            "O formato .xls (Excel antigo) não é suportado.\n"
+            "Abra o arquivo no Excel e salve como .xlsx."
+        )
 
+    try:
+        wb = load_workbook(caminho, read_only=True, data_only=True)
+    except Exception as e:
+        raise Exception(f"Não foi possível abrir o Excel:\n{e}")
+
+    try:
+        linhas = [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+    finally:
+        wb.close()
+
+    # Procura o cabeçalho (linha que contém "NOME") nas 20 primeiras linhas
     linha_cabecalho = None
-    for i in range(min(20, len(df_bruto))):
-        linha = df_bruto.iloc[i].fillna("").astype(str).str.upper().tolist()
-        if any("NOME" in cel for cel in linha):
+    for i, linha in enumerate(linhas[:20]):
+        if any("NOME" in _texto(cel).upper() for cel in linha):
             linha_cabecalho = i
             break
 
     if linha_cabecalho is None:
         raise Exception("Cabeçalho com 'NOME' não encontrado.")
 
-    df = pd.read_excel(caminho, header=linha_cabecalho)
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    cabecalho = [_texto(c).upper() for c in linhas[linha_cabecalho]]
 
-    col_nome = col_codigo = col_comunidade = col_tipo = None
-    for c in df.columns:
+    idx_nome = idx_codigo = idx_comunidade = idx_tipo = None
+    for i, c in enumerate(cabecalho):
+        sem_acento = _sem_acentos(c)
         if "NOME" in c:
-            col_nome = c
-        if "CÓDIGO" in c:
-            col_codigo = c
+            idx_nome = i
+        if "CODIGO" in sem_acento:
+            idx_codigo = i
         if "COMUNIDADE" in c or "CAPELA" in c:
-            col_comunidade = c
-        if _sem_acentos(c).strip() in NOMES_COLUNA_TIPO:
-            col_tipo = c
+            idx_comunidade = i
+        if sem_acento.strip() in NOMES_COLUNA_TIPO:
+            idx_tipo = i
 
-    if not all([col_nome, col_codigo, col_comunidade]):
+    if None in (idx_nome, idx_codigo, idx_comunidade):
         raise Exception("Colunas obrigatórias não encontradas.")
 
-    df[col_nome] = df[col_nome].fillna("").astype(str).str.upper()
-    df[col_codigo] = (
-        df[col_codigo]
-        .fillna("")
-        .astype(str)
-        .str.replace(r"\.0$", "", regex=True)
-    )
-    df[col_comunidade] = df[col_comunidade].fillna("").astype(str).str.upper()
+    def celula(linha, i):
+        return linha[i] if i < len(linha) else None
 
-    # Tipo de público por linha
-    if col_tipo:
-        tipos = []
-        invalidos = []
-        for idx, valor in enumerate(df[col_tipo].tolist()):
+    registros = []
+    invalidos = []
+    for j, linha in enumerate(linhas[linha_cabecalho + 1:]):
+        tipo = None
+        if idx_tipo is not None:
+            bruto = celula(linha, idx_tipo)
             try:
-                tipo = normalizar_tipo(valor)
+                tipo = normalizar_tipo(bruto)
             except ValueError:
                 # número da linha como aparece no Excel (1 = primeira linha da planilha)
-                invalidos.append(f"Linha {linha_cabecalho + idx + 2}: '{valor}'")
-                tipo = None
-            tipos.append(tipo or tipo_padrao)
+                invalidos.append(f"Linha {linha_cabecalho + j + 2}: '{bruto}'")
 
-        if invalidos:
-            raise Exception(
-                "Valores inválidos na coluna de tipo (use ADULTO ou INFANTIL):\n"
-                + "\n".join(invalidos[:10])
-                + ("\n..." if len(invalidos) > 10 else "")
-            )
-    else:
-        tipos = [tipo_padrao] * len(df)
+        registros.append({
+            "NOME": _texto(celula(linha, idx_nome)).upper(),
+            "CÓDIGO DIZIMISTA": _texto_codigo(celula(linha, idx_codigo)),
+            "COMUNIDADE": _texto(celula(linha, idx_comunidade)).upper(),
+            "TIPO": tipo or tipo_padrao,
+        })
 
-    saida = df[[col_nome, col_codigo, col_comunidade]].rename(columns={
-        col_nome: "NOME",
-        col_codigo: "CÓDIGO DIZIMISTA",
-        col_comunidade: "COMUNIDADE"
-    }).copy()
-    saida["TIPO"] = tipos
+    if invalidos:
+        raise Exception(
+            "Valores inválidos na coluna de tipo (use ADULTO ou INFANTIL):\n"
+            + "\n".join(invalidos[:10])
+            + ("\n..." if len(invalidos) > 10 else "")
+        )
 
-    return saida.reset_index(drop=True)
+    # Remove linhas totalmente vazias no final da planilha (formatação sobrando)
+    while registros and not (registros[-1]["NOME"] or registros[-1]["CÓDIGO DIZIMISTA"]
+                             or registros[-1]["COMUNIDADE"]):
+        registros.pop()
+
+    if not registros:
+        raise Exception("Nenhuma linha de dados encontrada no Excel.")
+
+    return registros
 
 
 # =========================
@@ -272,13 +296,11 @@ def ler_excel(caminho, tipo_padrao=TIPO_ADULTO):
 # =========================
 def montar_dados_manual(entradas):
     """
-    Converte a lista de etiquetas do modo manual em DataFrame, na ordem das posições.
+    Converte a lista de etiquetas do modo manual em lista de dicts, na ordem das posições.
     Posições puladas viram etiquetas em branco, para que cada nome caia exatamente
     na posição da folha que o usuário pediu. Cada etiqueta tem sua própria
     comunidade e seu próprio tipo (adulto/infantil).
     """
-    import pandas as pd
-
     if not entradas:
         raise Exception("Adicione ao menos uma etiqueta à lista.")
 
@@ -299,7 +321,7 @@ def montar_dados_manual(entradas):
         })
         pos_esperada += 1
 
-    return pd.DataFrame(dados)
+    return dados
 
 
 def proxima_posicao_livre():
@@ -425,10 +447,12 @@ def editar_manual(event):
 # =========================
 def gerar_pdf(dados):
     """
-    Gera o PDF. Cada linha de `dados` traz seu próprio TIPO ('adulto'/'infantil'),
-    então uma mesma folha pode misturar etiquetas de adulto e infantil.
+    Gera o PDF. Cada item de `dados` (lista de dicts) traz seu próprio TIPO
+    ('adulto'/'infantil'), então uma mesma folha pode misturar os dois.
     """
     try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.utils import simpleSplit
         from reportlab.pdfgen import canvas
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.pdfbase import pdfmetrics
@@ -444,7 +468,7 @@ def gerar_pdf(dados):
             save_dir = tempfile.gettempdir()
 
         # Só exige/registra as fontes ComicNeue se houver alguma etiqueta infantil
-        if (dados["TIPO"] == TIPO_INFANTIL).any():
+        if any(d["TIPO"] == TIPO_INFANTIL for d in dados):
             if hasattr(sys, "_MEIPASS"):
                 base_path = sys._MEIPASS
             else:
@@ -476,7 +500,7 @@ def gerar_pdf(dados):
         x, y = x0, y0
         contador = 0
 
-        for _, row in dados.iterrows():
+        for row in dados:
             nome = row["NOME"]
             codigo = row["CÓDIGO DIZIMISTA"]
             comunidade = row["COMUNIDADE"]
@@ -564,9 +588,8 @@ def gerar():
         else:
             local = f"em: {os.path.dirname(pdf_path)}"
 
-        preenchidas = dados["NOME"] != ""
-        qtd_adulto = int(((dados["TIPO"] == TIPO_ADULTO) & preenchidas).sum())
-        qtd_infantil = int(((dados["TIPO"] == TIPO_INFANTIL) & preenchidas).sum())
+        qtd_adulto = sum(1 for d in dados if d["NOME"] and d["TIPO"] == TIPO_ADULTO)
+        qtd_infantil = sum(1 for d in dados if d["NOME"] and d["TIPO"] == TIPO_INFANTIL)
 
         resposta = messagebox.askyesno(
             "Sucesso",
@@ -671,9 +694,10 @@ def abrir_crud_comunidades():
         CAPELAS[indice] = novo_nome
 
         # Propaga o novo nome para tudo que já usa a comunidade antiga
-        global dados_atual
         if dados_atual is not None:
-            dados_atual.loc[dados_atual["COMUNIDADE"] == antigo_nome, "COMUNIDADE"] = novo_nome
+            for d in dados_atual:
+                if d["COMUNIDADE"] == antigo_nome:
+                    d["COMUNIDADE"] = novo_nome
 
         for e in entradas_manuais:
             if e["COMUNIDADE"] == antigo_nome:
@@ -717,7 +741,7 @@ def abrir_crud_comunidades():
 
 
 def selecionar_excel():
-    arquivo = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+    arquivo = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm")])
     if arquivo:
         entrada_excel.delete(0, tk.END)
         entrada_excel.insert(0, arquivo)
@@ -748,7 +772,11 @@ def verificar_e_notificar_atualizacao():
     thread principal via root.after(...) na hora de mostrar diálogos.
     """
     def tarefa():
-        info = verificar_atualizacao(VERSION)
+        try:
+            import updater
+            info = updater.verificar_atualizacao(VERSION)
+        except Exception:
+            return  # falha na checagem nunca deve incomodar o usuário
         if info:
             root.after(0, lambda: _perguntar_atualizacao(info))
 
@@ -763,10 +791,12 @@ def _perguntar_atualizacao(info):
         f"Deseja baixar e instalar agora?"
     )
     if aceitar:
-        _baixar_com_barra_progresso(info["url"])
+        _baixar_com_barra_progresso(info)
 
 
-def _baixar_com_barra_progresso(url):
+def _baixar_com_barra_progresso(info):
+    import updater
+
     janela = tk.Toplevel(root)
     janela.title("Baixando atualização...")
     janela.geometry("360x110")
@@ -793,7 +823,11 @@ def _baixar_com_barra_progresso(url):
 
     def tarefa():
         try:
-            resultado["caminho"] = baixar_atualizacao(url, callback_progresso=progresso)
+            resultado["caminho"] = updater.baixar_atualizacao(
+                info["url"],
+                callback_progresso=progresso,
+                sha256_esperado=info.get("sha256"),
+            )
         except Exception as e:
             resultado["erro"] = str(e)
         janela.after(0, finalizar)
@@ -805,7 +839,7 @@ def _baixar_com_barra_progresso(url):
             return
         try:
             root.destroy()
-            aplicar_atualizacao_e_reiniciar(resultado["caminho"])
+            updater.aplicar_atualizacao_e_reiniciar(resultado["caminho"])
         except Exception as e:
             messagebox.showerror("Erro na atualização", str(e))
 

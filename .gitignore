@@ -1,10 +1,15 @@
 # ambiente virtual
 venv/
+.venv-build/
 
 # PyInstaller
 build/
 dist/
 *.spec
+
+# instalador (Inno Setup) e arquivos gerados pelo build.py
+installer/
+version_info.txt
 
 # cache
 __pycache__/
